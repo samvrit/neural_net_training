@@ -1,0 +1,9 @@
+[package]
+name = "sine_wave"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = "0.16"
+rand = "0.8.5"
+plotters = "0.3"
