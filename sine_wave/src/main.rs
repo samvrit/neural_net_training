@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Visualize training loss
     if !losses.is_empty() {
         let max_loss = losses.iter().copied().fold(0.0, f64::max);
-        let root = BitMapBackend::new("loss.png", (800, 600)).into_drawing_area();
+        let root = BitMapBackend::new("images/loss.png", (800, 600)).into_drawing_area();
         root.fill(&WHITE)?;
         let mut chart = ChartBuilder::on(&root)
             .caption("Training Loss", ("sans-serif", 30))
@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
 
-        let root2 = BitMapBackend::new("prediction.png", (800, 600)).into_drawing_area();
+        let root2 = BitMapBackend::new("images/prediction.png", (800, 600)).into_drawing_area();
         root2.fill(&WHITE)?;
         let mut chart2 = ChartBuilder::on(&root2)
             .caption("Network vs sin(x)", ("sans-serif", 30))
