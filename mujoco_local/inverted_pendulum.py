@@ -5,8 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 import torch_directml
+import matplotlib.pyplot as plt
+import numpy as np
 
 GAMMA = 0.99
+SIM_STEPS = 2048
 
 device = torch_directml.device()
 criterion_critic = torch.nn.MSELoss()
@@ -79,7 +82,11 @@ env = RecordVideo(
 # Reset environment
 state, info = env.reset()
 
-for i in range(2048):
+actor_losses = np.zeros(SIM_STEPS)
+critic_losses = np.zeros(SIM_STEPS)
+iterations = np.zeros(SIM_STEPS)
+
+for i in range(SIM_STEPS):
     # Get action from actor network
     output = actor_nn(torch.tensor(state, dtype=torch.float32, device=device))
     mu, log_sigma = output[0], output[1]  # Assuming output is [mu, log_sigma]
@@ -98,6 +105,8 @@ for i in range(2048):
 
     actor_loss_value = actor_loss(mu, sigma, action, advantage)
     critic_loss_value = critic_mse_loss(value, reward + (GAMMA * value_next))
+    actor_losses[i] = actor_loss_value.item()
+    critic_losses[i] = critic_loss_value.item()
 
     optimizer_actor.zero_grad()
     actor_loss_value.backward()
@@ -107,6 +116,8 @@ for i in range(2048):
     critic_loss_value.backward()
     optimizer_critic.step()
 
+    iterations[i] = i
+
     print(f"Step {i+1}: Reward={reward:.2f}, Advantage={advantage:.2f}, Actor Loss={actor_loss_value.item():.4f}, Critic Loss={critic_loss_value.item():.4f}")
 
     if not done:
@@ -114,5 +125,27 @@ for i in range(2048):
     else:
         state, info = env.reset()
 
+env.reset()
+
+# Verify that the trained model can run without errors
+for step in range(SIM_STEPS):
+    with torch.no_grad():
+        output = actor_nn(torch.tensor(state, dtype=torch.float32, device=device))
+        mu, log_sigma = output[0], output[1]
+
+        next_state, _, terminated, truncated, _ = env.step(mu.unsqueeze(0).cpu().numpy())
+
+        done = terminated or truncated
+        if not done:
+            state = next_state
+        else:
+            state, info = env.reset()
+            break
+
 env.close()
 # print(f"Ran {episodes} episodes with {steps} total steps")
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+ax[0].plot(iterations, actor_losses, color='blue')
+ax[1].plot(iterations, critic_losses, color='red')
+plt.savefig('cartpole-agent/1-losses.png')
