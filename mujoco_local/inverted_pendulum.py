@@ -10,6 +10,9 @@ import numpy as np
 
 GAMMA = 0.99
 SIM_STEPS = 2048
+LEARNING_RATE_ACTOR = 3e-4
+LEARNING_RATE_CRITIC = 1e-3
+NUM_EPISODES = 256
 
 device = torch_directml.device()
 criterion_critic = torch.nn.MSELoss()
@@ -25,7 +28,9 @@ class ActorNN(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
-        return x
+        mean = torch.tanh(x[..., 0]) * 3.0
+        sigma = F.softplus(x[..., 1]) + 1e-5
+        return mean, sigma
 
 class CriticNN(nn.Module):
     def __init__(self):
@@ -40,34 +45,11 @@ class CriticNN(nn.Module):
         x = self.fc3(x)
         return x
 
-def actor_loss(mu, sigma, action, advantage):
-    """
-    Compute the log probability of the action under a Gaussian distribution with mean mu and std sigma.
-    This can be used as the loss function for the actor network in policy gradient methods.
-    """
-    dist = Normal(mu, sigma)
-    log_prob = dist.log_prob(action).sum(dim=-1)  # Sum over action dimensions if multi-dimensional
-    return -(log_prob.mean() * advantage)  # Negative for minimization (policy gradient)
-
-def critic_mse_loss(predicted_value, target_value):
-    """
-    Compute the mean squared error loss for the critic network.
-    Used to train the value function to predict state values.
-    """
-    return criterion_critic(predicted_value, target_value)
-
-def advantage_estimation(reward, current_value, future_value, gamma=GAMMA):
-    """
-    Compute the advantage estimate using the reward, current value, and future value.
-    This can be used to compute the advantage for policy gradient updates.
-    """
-    return reward + (gamma * future_value) - current_value
-
 # 2. Initialize Model and Move to DirectML
 actor_nn = ActorNN().to(device)
 critic_nn = CriticNN().to(device)
-optimizer_actor = torch.optim.Adam(actor_nn.parameters(), lr=3e-4)
-optimizer_critic = torch.optim.Adam(critic_nn.parameters(), lr=3e-4)
+optimizer_actor = torch.optim.Adam(actor_nn.parameters(), lr=LEARNING_RATE_ACTOR)
+optimizer_critic = torch.optim.Adam(critic_nn.parameters(), lr=LEARNING_RATE_CRITIC)
 
 env = gym.make("InvertedPendulum-v5", render_mode="rgb_array", reset_noise_scale=0.1)
 
@@ -82,68 +64,63 @@ env = RecordVideo(
 # Reset environment
 state, info = env.reset()
 
-actor_losses = np.zeros(SIM_STEPS)
-critic_losses = np.zeros(SIM_STEPS)
-iterations = np.zeros(SIM_STEPS)
+actor_losses = []
+critic_losses = []
+iterations = []
 
-for i in range(SIM_STEPS):
-    # Get action from actor network
-    output = actor_nn(torch.tensor(state, dtype=torch.float32, device=device))
-    mu, log_sigma = output[0], output[1]  # Assuming output is [mu, log_sigma]
-    sigma = torch.exp(log_sigma)  # Convert log_sigma to sigma
-    dist = torch.distributions.Normal(mu, sigma)
-    action = dist.sample() # This is falling back to CPU and breaking the graph
-    log_prob = dist.log_prob(action)
+for episode in range(NUM_EPISODES):
+    done = False
+    state = torch.from_numpy(state).float()
+    total_reward = 0
+    state, info = env.reset()
+    while not done:
+        state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        value = critic_nn(state_tensor)
+    
+        # Get action from actor network
+        mu, sigma = actor_nn(state_tensor)
+        dist = torch.distributions.Normal(mu, sigma)
+        action = dist.sample()
+        action_to_step = action.detach().cpu().numpy().flatten()
 
-    value = critic_nn(torch.tensor(state, dtype=torch.float32, device=device))
-
-    next_state, reward, terminated, truncated, info = env.step(action.unsqueeze(0).cpu().numpy())
-    done = terminated or truncated
-
-    value_next = critic_nn(torch.tensor(next_state, dtype=torch.float32, device=device))
-    advantage = advantage_estimation(reward, value.item(), value_next.item(), gamma=GAMMA)
-
-    actor_loss_value = actor_loss(mu, sigma, action, advantage)
-    critic_loss_value = critic_mse_loss(value, reward + (GAMMA * value_next))
-    actor_losses[i] = actor_loss_value.item()
-    critic_losses[i] = critic_loss_value.item()
-
-    optimizer_actor.zero_grad()
-    actor_loss_value.backward()
-    optimizer_actor.step()
-
-    optimizer_critic.zero_grad()
-    critic_loss_value.backward()
-    optimizer_critic.step()
-
-    iterations[i] = i
-
-    print(f"Step {i+1}: Reward={reward:.2f}, Advantage={advantage:.2f}, Actor Loss={actor_loss_value.item():.4f}, Critic Loss={critic_loss_value.item():.4f}")
-
-    if not done:
-        state = next_state
-    else:
-        state, info = env.reset()
-
-env.reset()
-
-# Verify that the trained model can run without errors
-for step in range(SIM_STEPS):
-    with torch.no_grad():
-        output = actor_nn(torch.tensor(state, dtype=torch.float32, device=device))
-        mu, log_sigma = output[0], output[1]
-
-        next_state, _, terminated, truncated, _ = env.step(mu.unsqueeze(0).cpu().numpy())
-
+        next_state, reward, terminated, truncated, info = env.step(action_to_step)
         done = terminated or truncated
-        if not done:
-            state = next_state
-        else:
-            state, info = env.reset()
-            break
+
+        next_state_tensor = torch.as_tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
+        value_next = critic_nn(next_state_tensor)
+
+        with torch.no_grad():
+            target = reward + (GAMMA * value_next if not done else 0)
+
+        # 2. Convert target to a tensor matching the device of 'value'
+        target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
+        target_tensor = target_tensor.view_as(value)
+        advantage = target - value
+        
+        # Actor and critic losses
+        log_prob = dist.log_prob(action)
+        actor_loss = -(log_prob * advantage.detach())
+        critic_loss = F.mse_loss(value, target_tensor)
+
+        actor_losses.append(actor_loss.item())
+        critic_losses.append(critic_loss.item())
+
+        optimizer_actor.zero_grad()
+        actor_loss.backward()
+        optimizer_actor.step()
+
+        optimizer_critic.zero_grad()
+        critic_loss.backward()
+        optimizer_critic.step()
+
+        state = next_state
+        total_reward += reward
+        iterations.append(len(iterations))
+
+    if episode % 10 == 0:
+        print(f"Episode {episode} | Reward: {total_reward:.2f}")
 
 env.close()
-# print(f"Ran {episodes} episodes with {steps} total steps")
 
 fig, ax = plt.subplots(1, 2, figsize=(10, 4))
 ax[0].plot(iterations, actor_losses, color='blue')
