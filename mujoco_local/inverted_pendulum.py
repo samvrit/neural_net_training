@@ -9,13 +9,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 GAMMA = 0.99
-SIM_STEPS = 2048
+SIM_STEPS = 1000
 LEARNING_RATE_ACTOR = 3e-4
 LEARNING_RATE_CRITIC = 1e-3
-NUM_EPISODES = 256
+NUM_EPISODES = 100
+NUM_TRAINING_EPOCHS = 10
+EPS_CLIP = 0.2
 
-device = torch_directml.device()
-criterion_critic = torch.nn.MSELoss()
+device = torch.device("cpu")
 
 class ActorNN(nn.Module):
     def __init__(self):
@@ -67,15 +68,24 @@ state, info = env.reset()
 actor_losses = []
 critic_losses = []
 iterations = []
+rewards_per_episode = []
+sigma_values = []
 
 for episode in range(NUM_EPISODES):
     done = False
     state = torch.from_numpy(state).float()
     total_reward = 0
     state, info = env.reset()
-    while not done:
+
+    states_list = []
+    actions_list = []
+    log_probs_list = []
+    rewards_list = []
+    dones_list = []
+    steps_per_episode = 0
+
+    while (steps_per_episode < SIM_STEPS):
         state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-        value = critic_nn(state_tensor)
     
         # Get action from actor network
         mu, sigma = actor_nn(state_tensor)
@@ -86,24 +96,57 @@ for episode in range(NUM_EPISODES):
         next_state, reward, terminated, truncated, info = env.step(action_to_step)
         done = terminated or truncated
 
-        next_state_tensor = torch.as_tensor(next_state, dtype=torch.float32, device=device).unsqueeze(0)
-        value_next = critic_nn(next_state_tensor)
-
-        with torch.no_grad():
-            target = reward + (GAMMA * value_next if not done else 0)
-
-        # 2. Convert target to a tensor matching the device of 'value'
-        target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
-        target_tensor = target_tensor.view_as(value)
-        advantage = target - value
-        
-        # Actor and critic losses
         log_prob = dist.log_prob(action)
-        actor_loss = -(log_prob * advantage.detach())
-        critic_loss = F.mse_loss(value, target_tensor)
 
-        actor_losses.append(actor_loss.item())
-        critic_losses.append(critic_loss.item())
+        states_list.append(state)
+        actions_list.append(action.detach().cpu().numpy())
+        log_probs_list.append(log_prob.detach())
+        rewards_list.append(reward)
+        dones_list.append(done)
+        sigma_values.append(sigma.detach().cpu().numpy())
+
+        total_reward += reward
+        iterations.append(len(iterations))
+        steps_per_episode += 1
+
+        if done:
+            state, info = env.reset()
+        else:
+            state = next_state
+
+    rewards_per_episode.append(total_reward)
+
+    returns = []
+    discounted_reward = 0
+    for reward, done in zip(reversed(rewards_list), reversed(dones_list)):
+        if done:
+            discounted_reward = reward
+        else:
+            discounted_reward = reward + (GAMMA * discounted_reward)
+        returns.insert(0, discounted_reward)
+    returns = torch.tensor(returns, dtype=torch.float32).to(device)
+
+    # Convert lists to Tensors
+    states = torch.from_numpy(np.array(states_list)).float().to(device)
+    actions = torch.from_numpy(np.array(actions_list)).float().to(device).squeeze(-1)  # [T]
+    old_log_probs = torch.stack(log_probs_list).detach().squeeze(-1)  # [T]
+
+    for _ in range(NUM_TRAINING_EPOCHS):
+        mu, sigma = actor_nn(states)
+        dist = torch.distributions.Normal(mu, sigma)
+        new_log_probs = dist.log_prob(actions)
+        entropy = dist.entropy().mean()
+
+        values = critic_nn(states).squeeze()
+        advantages = returns - values.detach()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1-EPS_CLIP, 1+EPS_CLIP) * advantages
+        actor_loss = -torch.min(surr1, surr2).mean() - (0.01 * entropy)
+
+        critic_loss = F.mse_loss(values, returns)
 
         optimizer_actor.zero_grad()
         actor_loss.backward()
@@ -113,16 +156,11 @@ for episode in range(NUM_EPISODES):
         critic_loss.backward()
         optimizer_critic.step()
 
-        state = next_state
-        total_reward += reward
-        iterations.append(len(iterations))
-
-    if episode % 10 == 0:
-        print(f"Episode {episode} | Reward: {total_reward:.2f}")
+    print(f"Episode {episode} | Reward: {total_reward:.2f}")
 
 env.close()
 
 fig, ax = plt.subplots(1, 2, figsize=(10, 4))
-ax[0].plot(iterations, actor_losses, color='blue')
-ax[1].plot(iterations, critic_losses, color='red')
+ax[0].plot(range(NUM_EPISODES), rewards_per_episode, color='blue')
+ax[1].plot(iterations, sigma_values, color='red')
 plt.savefig('cartpole-agent/1-losses.png')
