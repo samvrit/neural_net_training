@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-import torch_directml
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -15,9 +14,12 @@ LEARNING_RATE_CRITIC = 1e-3
 NUM_EPISODES = 100
 NUM_TRAINING_EPOCHS = 10
 EPS_CLIP = 0.2
+NUM_INFERENCE_EPISODES = 5
+ENV_NAME = "InvertedPendulum-v5"
 
 device = torch.device("cpu")
 
+# 1. Define Actor and Critic Networks
 class ActorNN(nn.Module):
     def __init__(self):
         super(ActorNN, self).__init__()
@@ -52,15 +54,7 @@ critic_nn = CriticNN().to(device)
 optimizer_actor = torch.optim.Adam(actor_nn.parameters(), lr=LEARNING_RATE_ACTOR)
 optimizer_critic = torch.optim.Adam(critic_nn.parameters(), lr=LEARNING_RATE_CRITIC)
 
-env = gym.make("InvertedPendulum-v5", render_mode="rgb_array", reset_noise_scale=0.1)
-
-# Add video recording for every episode
-env = RecordVideo(
-    env,
-    video_folder="cartpole-agent",    # Folder to save videos
-    name_prefix="eval",               # Prefix for video filenames
-    episode_trigger=lambda x: True    # Record every episode
-)
+env = gym.make(ENV_NAME, reset_noise_scale=0.1)
 
 # Reset environment
 state, info = env.reset()
@@ -71,6 +65,7 @@ iterations = []
 rewards_per_episode = []
 sigma_values = []
 
+# 3. Training Loop
 for episode in range(NUM_EPISODES):
     done = False
     state = torch.from_numpy(state).float()
@@ -89,7 +84,7 @@ for episode in range(NUM_EPISODES):
     
         # Get action from actor network
         mu, sigma = actor_nn(state_tensor)
-        dist = torch.distributions.Normal(mu, sigma)
+        dist = Normal(mu, sigma)
         action = dist.sample()
         action_to_step = action.detach().cpu().numpy().flatten()
 
@@ -131,9 +126,10 @@ for episode in range(NUM_EPISODES):
     actions = torch.from_numpy(np.array(actions_list)).float().to(device).squeeze(-1)  # [T]
     old_log_probs = torch.stack(log_probs_list).detach().squeeze(-1)  # [T]
 
+    # Update Actor and Critic Networks
     for _ in range(NUM_TRAINING_EPOCHS):
         mu, sigma = actor_nn(states)
-        dist = torch.distributions.Normal(mu, sigma)
+        dist = Normal(mu, sigma)
         new_log_probs = dist.log_prob(actions)
         entropy = dist.entropy().mean()
 
@@ -160,6 +156,37 @@ for episode in range(NUM_EPISODES):
 
 env.close()
 
+# 4. Inference and Evaluation
+eval_env = RecordVideo(
+    gym.make(ENV_NAME, render_mode="rgb_array", reset_noise_scale=0.1),
+    video_folder="cartpole-agent",
+    name_prefix="eval",
+    episode_trigger=lambda episode_id: True
+)
+
+for eval_episode in range(NUM_INFERENCE_EPISODES):
+    state, info = eval_env.reset()
+    done = False
+    total_reward = 0.0
+    steps = 0
+
+    while not done and steps < SIM_STEPS:
+        state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+
+        with torch.no_grad():
+            mu, _ = actor_nn(state_tensor)
+
+        action_to_step = mu.detach().cpu().numpy().flatten()
+        state, reward, terminated, truncated, info = eval_env.step(action_to_step)
+        done = terminated or truncated
+        total_reward += reward
+        steps += 1
+
+    print(f"Inference Episode {eval_episode + 1} | Reward: {total_reward:.2f}")
+
+eval_env.close()
+
+# 5. Plotting Rewards and Sigma Values
 fig, ax = plt.subplots(1, 2, figsize=(10, 4))
 ax[0].plot(range(NUM_EPISODES), rewards_per_episode, color='blue')
 ax[1].plot(iterations, sigma_values, color='red')
